@@ -2,7 +2,7 @@
 
 __author__ = "Hendrik Weiske"
 __credits__ = ["Franz Thiemann"]
-__version__ = "1.3"
+__version__ = "1.4"
 __maintainer__ = "Hendrik Weiske"
 __email__ = "hendrik.weiske@uni-leipzig.de"
 
@@ -10,8 +10,8 @@ bl_info = {
     "name": "ASE Importer",
     "description": "Import molecules using ASE",
     "author": "Hendrik Weiske",
-    "version": (1, 3),
-    "blender": (4, 0, 0),
+    "version": (1, 4),
+    "blender": (4, 1, 1),
     "location": "File > Import",
     "category": "Import-Export",
 }
@@ -41,8 +41,10 @@ class ImportASEMolecule(bpy.types.Operator, ImportHelper):
 
     supercell1: bpy.props.IntVectorProperty(
         name="Supercell-vector",
-        size=9,
-        default=[1, 0, 0, 0, 1, 0, 0, 0, 1],
+        size=3,
+        default=[1, 1, 1],
+        min=0,
+        subtype="XYZ"
     )
     scale: bpy.props.FloatProperty(
         name="Scale",
@@ -123,14 +125,14 @@ class ImportASEMolecule(bpy.types.Operator, ImportHelper):
     def draw(self, context):
         layout = self.layout
         box = layout.box()
-        box.label(text="")
+        box.label(text="Create Supercell")
         box.separator()
         # commented out because it throws errors, don't know what it does anyhow... -PM
         #box.operator("import_scene.my_format", text="Import")
-        for i in range(3):
+
+        for i, text in enumerate(["X", "Y", "Z"]):
             row = box.row(align=True)
-            for j in range(3):
-                row.prop(self, "supercell1", index=i * 3 + j, emboss=False, slider=True)
+            row.prop(self, "supercell1", text=text, index=i, emboss=False, slider=True)
         layout.prop(self, "scale")
         layout.prop(self, 'colorbonds')
         layout.prop(self, 'fix_bonds')
@@ -146,7 +148,7 @@ class ImportASEMolecule(bpy.types.Operator, ImportHelper):
     def execute(self, context):
         for file in self.files:
             filepath = join(self.directory, file.name)
-            matrix = np.array(self.supercell1).reshape((3, 3))
+            matrix = np.diag(self.supercell1)
             default = [1, 0, 0, 0, 1, 0, 0, 0, 1]
             SUPERCELL = False
             for n, i in enumerate(self.supercell1):

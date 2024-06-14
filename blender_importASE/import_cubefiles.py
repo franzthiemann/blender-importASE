@@ -9,11 +9,20 @@ from .utils import toggle
 import os.path
 
 
-def cube2vol(filename, filepath=os.environ.get('HOME')):
+def cube2vol(filename, filepath=os.environ.get('HOME'), supercell=np.array([1, 1, 1])):
     with open(filename, 'r') as f:
         atoms = read_cube(f, read_data=True, verbose=True)
         ORIGIN = atoms['origin']
     VOLUME = atoms['data']
+    # Apply supercell transformation if required
+    if not np.array_equal(supercell, np.array([1, 1, 1])):
+        # Extend the volume in the Directions
+        # print("Creating supercell of Volume, this may take a while")
+        for ax, dim in enumerate(supercell):
+            if dim > 1:
+                cell_vol = VOLUME.copy()
+                for i in range(dim - 1):
+                    VOLUME = np.concatenate((VOLUME, cell_vol), axis=ax)
     GRID = vdb.FloatGrid()
     GRID.copyFromArray(VOLUME.astype(float))
     # SPACING=np.array(atoms['spacing']).T
@@ -28,10 +37,8 @@ def cube2vol(filename, filepath=os.environ.get('HOME')):
     GRID.gridClass = vdb.GridClass.FOG_VOLUME
     GRID.name = 'density'
     TMPFILE = filename.split('.')[-2] + '_density.vdb'
-    if os.path.isfile(TMPFILE):
-        skip = True
-    else:
-        vdb.write(TMPFILE, GRID)
+    # Always rewrite the tempfile otherwise importing with different cell sizes has no effect
+    vdb.write(TMPFILE, GRID)
     VOL = bpy.ops.object.volume_import(filepath=TMPFILE, location=ORIGIN)
     #    os.remove(TMPFILE)
     # bpy.data.objects[TMPFILE.split('.')[-2].split('/')[-1]].select_set(True)
