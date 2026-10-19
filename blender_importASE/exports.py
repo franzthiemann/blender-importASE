@@ -11,6 +11,7 @@ import os
 import tempfile
 import zipfile
 import math
+from contextlib import contextmanager
 
 import bpy
 import numpy as np
@@ -45,7 +46,7 @@ def export_xyz(obj, filepath):
 def build_supports(atom_objects, collection, base_radius=0.25, tip_radius=0.1,
                    support_layer=0.8, plate_thickness=0.6, plate_holes=True,
                    plate_margin=1.0, pillar_length=2.0, segments=12,
-                   bond_radius=0.15, bond_objects=None):
+                   bond_radius=0.15, bond_objects=None, pillar_material=False):
     """Resin supports: a base plate below the model and tapered pillars up
     to every atom that would print as an island.
 
@@ -64,19 +65,31 @@ def build_supports(atom_objects, collection, base_radius=0.25, tip_radius=0.1,
     base_radius/tip_radius: pillar radius at the plate and at the atom
     contact point. support_layer: minimum height a bonded/touching
     neighbor must sit below an atom to hold it up - larger values treat
-    shallower bonds as overhangs and add more pillars. Returns the
-    created object.
+    shallower bonds as overhangs and add more pillars.
+
+    pillar_material: build the pillars as one object per element of the
+    atom they hold up (marked 'ase_support_element', with that element's
+    material), so they print in the atom's filament and blend in; the
+    plate stays its own object. Returns the created objects, plate first.
     """
     from ase.data import covalent_radii, atomic_numbers
 
-    centers, sphere_radii, bond_radii = [], [], []
+    centers, sphere_radii, bond_radii, symbols = [], [], [], []
     for ob in atom_objects:
-        corners = [ob.matrix_world @ Vector(c) for c in ob.bound_box]
-        origin = np.array(ob.matrix_world.translation)
-        centers.append(origin)
-        zs = [v.z for v in corners]
-        sphere_radii.append((max(zs) - min(zs)) / 2)
+        # measured on the sphere's own vertices in world space: the object
+        # origin is not the center once the transforms are applied, and the
+        # corners of a rotated object's bounding box span more than the
+        # sphere (pillar tips would stop short of it); the plain mesh also
+        # leaves out the outline shell
+        co = np.empty(3 * len(ob.data.vertices))
+        ob.data.vertices.foreach_get('co', co)
+        mw = np.array(ob.matrix_world)
+        co = co.reshape(-1, 3) @ mw[:3, :3].T + mw[:3, 3]
+        lo, hi = co.min(axis=0), co.max(axis=0)
+        centers.append((lo + hi) / 2)
+        sphere_radii.append((hi[2] - lo[2]) / 2)
         symbol = ob.name.split('.')[0]
+        symbols.append(symbol)
         bond_radii.append(covalent_radii[atomic_numbers.get(symbol, 6)])
     centers = np.array(centers)
     sphere_radii = np.array(sphere_radii)
@@ -211,28 +224,31 @@ def build_supports(atom_objects, collection, base_radius=0.25, tip_radius=0.1,
         if base is None:
             skipped += 1
             continue
-        pillars.append((base[0], base[1], tip[0], tip[1], tip[2]))
+        pillars.append((base[0], base[1], tip[0], tip[1], tip[2], symbols[i]))
     if skipped:
         print(f'supports: {skipped} atom(s) left unsupported (no pillar path '
               'avoids other atoms)')
 
-    verts, faces = [], []
+    verts, faces = [], []  # the plate (and the pillars, unless split)
+    pillar_meshes = {}     # element -> (verts, faces) with pillar_material
 
-    def add_ring(x, y, z, radius):
+    def add_ring(verts, x, y, z, radius):
         start = len(verts)
         for k in range(segments):
             a = 2 * math.pi * k / segments
             verts.append((x + radius * math.cos(a), y + radius * math.sin(a), z))
         return start
 
-    def add_pillar(base_x, base_y, base_z, tip_x, tip_y, tip_z):
-        bottom = add_ring(base_x, base_y, base_z, base_radius)
-        top = add_ring(tip_x, tip_y, tip_z + 0.1, tip_radius)  # embed tip
+    def add_pillar(base_x, base_y, base_z, tip_x, tip_y, tip_z, symbol):
+        pv, pf = (pillar_meshes.setdefault(symbol, ([], []))
+                  if pillar_material else (verts, faces))
+        bottom = add_ring(pv, base_x, base_y, base_z, base_radius)
+        top = add_ring(pv, tip_x, tip_y, tip_z + 0.1, tip_radius)  # embed tip
         for k in range(segments):
             m = (k + 1) % segments
-            faces.append([bottom + k, bottom + m, top + m, top + k])
-        faces.append([top + k for k in range(segments)][::-1])
-        faces.append([bottom + k for k in range(segments)])
+            pf.append([bottom + k, bottom + m, top + m, top + k])
+        pf.append([top + k for k in range(segments)][::-1])
+        pf.append([bottom + k for k in range(segments)])
 
     # plate layout: a solid slab, optionally with a regular grid of square
     # holes punched in to save material
@@ -286,9 +302,9 @@ def build_supports(atom_objects, collection, base_radius=0.25, tip_radius=0.1,
     if pillars:
         if plate_holes:
             holes_x, holes_y = hole_grid()
-            for bx, by, tx, ty, tz in pillars:
+            for bx, by, tx, ty, tz, symbol in pillars:
                 px, py = push_off_holes(bx, by, holes_x, holes_y)
-                add_pillar(px, py, plate_top, tx, ty, tz)
+                add_pillar(px, py, plate_top, tx, ty, tz, symbol)
             # full-width strips between the hole rows...
             y_edges = [y0] + [e for hy in holes_y for e in (hy, hy + hole)] + [y1]
             for yA, yB in zip(y_edges[0::2], y_edges[1::2]):
@@ -299,17 +315,66 @@ def build_supports(atom_objects, collection, base_radius=0.25, tip_radius=0.1,
                 for xA, xB in zip(x_edges[0::2], x_edges[1::2]):
                     add_box(xA, xB, hy, hy + hole, z0, z1)
         else:
-            for bx, by, tx, ty, tz in pillars:
-                add_pillar(bx, by, plate_top, tx, ty, tz)
+            for bx, by, tx, ty, tz, symbol in pillars:
+                add_pillar(bx, by, plate_top, tx, ty, tz, symbol)
             add_box(x0, x1, y0, y1, z0, z1)
 
-    mesh = bpy.data.meshes.new('supports')
-    mesh.from_pydata(verts, [], faces)
-    mesh.update()
-    obj = bpy.data.objects.new('supports', mesh)
-    collection.objects.link(obj)
-    obj['ase_auto_supports'] = True
-    return obj
+    # remembered so the export and the rebuild operator can start from the
+    # supports as they are, and tell whether new settings need a rebuild
+    params = {
+        'base_radius': base_radius, 'tip_radius': tip_radius,
+        'support_layer': support_layer, 'plate_thickness': plate_thickness,
+        'plate_holes': plate_holes, 'pillar_length': pillar_length,
+        'pillar_material': pillar_material}
+
+    def make_object(name, verts, faces, symbol=None):
+        mesh = bpy.data.meshes.new(name)
+        mesh.from_pydata(verts, [], faces)
+        mesh.update()
+        obj = bpy.data.objects.new(name, mesh)
+        collection.objects.link(obj)
+        obj['ase_auto_supports'] = True
+        obj['ase_support_params'] = params
+        if symbol is not None:
+            obj['ase_support_element'] = symbol
+            atom = atom_objects[symbols.index(symbol)]
+            if atom.active_material is not None:
+                mesh.materials.append(atom.active_material)
+        return obj
+
+    objects = [make_object('supports', verts, faces)]
+    for symbol in sorted(pillar_meshes):
+        objects.append(make_object(f'supports_{symbol}', *pillar_meshes[symbol],
+                                   symbol=symbol))
+    return objects
+
+
+@contextmanager
+def outlines_disabled(objects):
+    """Switch off the 'outline' geometry-nodes modifiers of `objects` for
+    the duration of the block.
+
+    The outline is a render effect: it joins the mesh with a copy pushed
+    out along the normals, so evaluating it for print geometry would give
+    every atom, bond and joint a second, slightly larger shell nested
+    around the real one (and inflate the sizes the supports are fitted
+    to)."""
+    switched = []
+    for ob in objects:
+        for mod in ob.modifiers:
+            if (mod.type == 'NODES' and mod.node_group is not None
+                    and mod.node_group.name.startswith('outline')):
+                # both flags: Blender 5.2's STL exporter evaluates the
+                # render visibility, older versions the viewport one
+                switched.append((mod, mod.show_viewport, mod.show_render))
+                mod.show_viewport = mod.show_render = False
+    bpy.context.view_layer.update()
+    try:
+        yield
+    finally:
+        for mod, viewport, render in switched:
+            mod.show_viewport, mod.show_render = viewport, render
+        bpy.context.view_layer.update()
 
 
 def collect_print_objects(context):
@@ -345,6 +410,25 @@ def collect_print_objects(context):
     return collection, groups, bonds, supports
 
 
+def stored_support_params(context):
+    """The build_supports parameters the active structure's automatic
+    supports were made with, or None (no structure, no automatic
+    supports, or supports from a version that did not record them)."""
+    try:
+        supports = collect_print_objects(context)[3]
+    except ValueError:
+        return None
+    for ob in supports:
+        if ob.get('ase_auto_supports') and 'ase_support_params' in ob:
+            return {k: v for k, v in ob['ase_support_params'].items()}
+    return None
+
+
+def _same_params(a, b):
+    return a is not None and set(a) == set(b) and all(
+        abs(float(a[k]) - float(b[k])) < 1e-6 for k in b)
+
+
 def rebuild_supports(context, **params):
     """(Re)generate the automatic supports of the active structure with the
     given build_supports parameters. Auto-generated supports (marked with
@@ -358,21 +442,75 @@ def rebuild_supports(context, **params):
         else:
             kept.append(ob)
     atom_objects = [ob for objs in groups.values() for ob in objs]
-    kept.append(build_supports(atom_objects, collection, bond_objects=bonds, **params))
+    with outlines_disabled(atom_objects + bonds):
+        kept.extend(build_supports(atom_objects, collection,
+                                   bond_objects=bonds, **params))
     return kept
+
+
+_STL_DTYPE = np.dtype([('normal', '<f4', 3), ('verts', '<f4', (3, 3)),
+                       ('attr', '<u2')])
+
+
+def _read_stl(path):
+    """Header and triangle records of a binary STL."""
+    with open(path, 'rb') as f:
+        data = f.read()
+    n = int.from_bytes(data[80:84], 'little')
+    return data[:80], np.frombuffer(data[84:84 + 50 * n], dtype=_STL_DTYPE).copy()
+
+
+def _write_stl(path, header, tris):
+    with open(path, 'wb') as f:
+        f.write(header)
+        f.write(len(tris).to_bytes(4, 'little'))
+        f.write(tris.tobytes())
+
+
+def place_for_print(stl_paths, scale):
+    """Move and scale the STL files as one rigid body: centered on the
+    origin in x/y, the lowest point (the support plate) at z=0, and
+    `scale` mm per Angstrom.
+
+    STL carries no units - slicers read the numbers as mm. Left in
+    Angstrom, a molecule is a few mm across and single parts are small
+    enough for a slicer to offer a unit conversion on some files but not
+    others; and parts far from the origin are re-centered one by one.
+    The same transform on every file keeps them aligned."""
+    loaded = {p: _read_stl(p) for p in stl_paths}
+    verts = [t['verts'].reshape(-1, 3) for _, t in loaded.values() if len(t)]
+    if not verts:
+        return
+    verts = np.concatenate(verts)
+    lo, hi = verts.min(axis=0), verts.max(axis=0)
+    offset = np.array([(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, lo[2]])
+    for path, (header, tris) in loaded.items():
+        tris['verts'] = (tris['verts'] - offset) * scale
+        _write_stl(path, header, tris)
 
 
 def export_3dprint(context, filepath, generate_supports=True,
                    base_radius=0.25, tip_radius=0.1, support_layer=0.8,
-                   plate_thickness=0.6, plate_holes=True, plate_gap=2.0):
+                   plate_thickness=0.6, plate_holes=True, plate_gap=2.0,
+                   print_scale=10.0, pillar_material=False):
     """Export the collection of the active object as per-element STLs,
     the bonds, and supports, zipped into `filepath`.
 
-    Existing supports in the scene (whatever "Rebuild 3D-print supports"
-    last produced, or any you made yourself) are exported as-is, so
-    re-exporting after a rebuild picks up exactly what you see. The
-    support parameters below are only used to generate supports the
-    first time, when none exist yet.
+    All files share one frame: print_scale mm per Angstrom, centered on
+    the origin with the plate on z=0 (see place_for_print), so loading
+    them together as one multi-part object keeps them aligned.
+
+    With generate_supports, the automatic supports are built with the
+    support parameters below: existing automatic supports made with the
+    same parameters are exported as they are (exactly what you see),
+    otherwise they are rebuilt. Supports you made yourself (no
+    ase_auto_supports mark) are always exported as-is, and no automatic
+    ones are added next to them. Without generate_supports, whatever
+    supports exist are exported unchanged.
+
+    pillar_material: the pillars go into the STL of the element they hold
+    up (atoms_<element>.stl), so the slicer prints them in that atom's
+    filament; only the plate stays in supports.stl.
     """
     collection, groups, bonds, supports = collect_print_objects(context)
 
@@ -384,13 +522,14 @@ def export_3dprint(context, filepath, generate_supports=True,
                 ob.data.transform(Matrix.Diagonal((*ob.scale, 1.0)))
                 ob.scale = (1.0, 1.0, 1.0)
 
-    if not supports and generate_supports:
-        supports = rebuild_supports(context, base_radius=base_radius,
-                                    tip_radius=tip_radius,
-                                    support_layer=support_layer,
-                                    plate_thickness=plate_thickness,
-                                    plate_holes=plate_holes,
-                                    pillar_length=plate_gap)
+    params = dict(base_radius=base_radius, tip_radius=tip_radius,
+                  support_layer=support_layer,
+                  plate_thickness=plate_thickness, plate_holes=plate_holes,
+                  pillar_length=plate_gap, pillar_material=pillar_material)
+    user_made = [ob for ob in supports if not ob.get('ase_auto_supports')]
+    if generate_supports and not user_made and not _same_params(
+            stored_support_params(context), params):
+        supports = rebuild_supports(context, **params)
 
     tmpdir = tempfile.mkdtemp(prefix='ase_3dprint_')
 
@@ -405,12 +544,24 @@ def export_3dprint(context, filepath, generate_supports=True,
         return stl_path
 
     stl_files = []
-    for element in sorted(groups):
-        stl_files.append(write_stl(groups[element], f'atoms_{element}.stl'))
-    if bonds:
-        stl_files.append(write_stl(bonds, 'bonds.stl'))
-    if supports:
-        stl_files.append(write_stl(supports, 'supports.stl'))
+    atom_objects = [ob for objs in groups.values() for ob in objs]
+    # pillars built per element (pillar_material) print with their atoms
+    pillars = {}
+    for ob in supports:
+        if ob.get('ase_support_element') in groups:
+            pillars.setdefault(ob['ase_support_element'], []).append(ob)
+    plate = [ob for ob in supports
+             if not any(ob in objs for objs in pillars.values())]
+    with outlines_disabled(atom_objects + bonds + supports):
+        for element in sorted(groups):
+            stl_files.append(write_stl(groups[element] + pillars.get(element, []),
+                                       f'atoms_{element}.stl'))
+        if bonds:
+            stl_files.append(write_stl(bonds, 'bonds.stl'))
+        if plate:
+            stl_files.append(write_stl(plate, 'supports.stl'))
+
+    place_for_print(stl_files, print_scale)
 
     with zipfile.ZipFile(filepath, 'w', zipfile.ZIP_DEFLATED) as archive:
         for stl in stl_files:

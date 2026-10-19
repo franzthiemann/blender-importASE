@@ -448,16 +448,29 @@ class ASE_OT_rebuild_supports(bpy.types.Operator):
     plate_gap: bpy.props.FloatProperty(
         name="plate gap", default=2.0, min=0.0, soft_max=10.0,
         description="distance from the base plate up to the lowest atom")
+    pillar_material: bpy.props.BoolProperty(
+        name="pillars in atom material", default=False,
+        description="make each pillar out of the material of the atom it holds up, so it prints in that atom's filament")
+
+    def invoke(self, context, event):
+        # start from the supports as they are, not the defaults
+        from .exports import stored_support_params
+        from . import apply_support_params
+        apply_support_params(self, stored_support_params(context))
+        return self.execute(context)
 
     def execute(self, context):
-        from .exports import rebuild_supports
+        from .exports import rebuild_supports, stored_support_params
+        from . import apply_support_params
+        apply_support_params(self, stored_support_params(context), only_unset=True)
         try:
             rebuild_supports(context, base_radius=self.base_radius,
                              tip_radius=self.tip_radius,
                              support_layer=self.support_layer,
                              plate_thickness=self.plate_thickness,
                              plate_holes=self.plate_holes,
-                             pillar_length=self.plate_gap)
+                             pillar_length=self.plate_gap,
+                             pillar_material=self.pillar_material)
         except ValueError as exc:
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}

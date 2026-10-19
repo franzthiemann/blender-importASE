@@ -457,11 +457,15 @@ Import with `representation='3D_print'` (real spheres + fused node bonds with ic
 ```python
 exports.export_3dprint(context, filepath, generate_supports=True,
     base_radius=0.25, tip_radius=0.1, support_layer=0.8, plate_thickness=0.6,
-    plate_holes=True, plate_gap=2.0)
+    plate_holes=True, plate_gap=2.0, print_scale=10.0)
 ```
-Writes one STL per element + `bonds.stl` + `supports.stl` and zips them.
+Writes one STL per element + `bonds.stl` + `supports.stl` and zips them. All files share one frame (`place_for_print`): `print_scale` mm per Å (STL has no units and slicers read mm, so unscaled a molecule is only a few mm and slicers offer unit conversions file by file), centered on the origin with the plate on z=0. In the slicer, load all files at once as **one multi-part object** so they stay aligned; each part can then get its own filament.
 
-**Support behavior to know:** supports are generated **only if none already exist**. If you (or the Rebuild button) already made supports, `export_3dprint` exports them **as-is** and ignores its own support parameters. So the workflow is: rebuild supports in the N-panel until they look right, *then* export — the export reuses exactly what you see. Support generation uses a BVH of the real drawn bond geometry as the single source of truth for connectivity and obstacle avoidance (never skewers an atom; may graze bonds), with bottom-up island grounding and an optional holed base plate.
+The outline modifier is a render effect and is switched off while exporting (`outlines_disabled`), otherwise every part would get a second, larger shell. Joints and supports are placed at the atom spheres' centers, not the object origins, so applying the atoms' transforms before exporting is fine.
+
+**Support behavior to know:** `build_supports` records its parameters on the supports object (`ase_support_params`, next to the `ase_auto_supports` mark). The export dialog and the N-panel **Rebuild supports** operator both start from those values (`exports.stored_support_params`), so they show the supports as they are. On export, automatic supports built with the same settings are exported unchanged (exactly what you see); changed settings rebuild them first. Supports from before this was recorded count as changed, so they are rebuilt with the dialog values. Supports you made yourself (no `ase_auto_supports` mark) are always exported as-is, with no automatic ones added. `generate_supports=False` exports whatever exists, unchanged.
+
+**Pillars in atom material** (`pillar_material=True`, in the export dialog and the Rebuild operator): the pillars are built as one object per element of the atom they hold up (`supports_<element>`, marked `ase_support_element`, with that element's material) and exported inside `atoms_<element>.stl`, so they print in the atom's filament and blend in; `supports.stl` then holds only the base plate. `build_supports` returns its objects as a list, plate first. Support generation uses a BVH of the real drawn bond geometry as the single source of truth for connectivity and obstacle avoidance (never skewers an atom; may graze bonds), with bottom-up island grounding and an optional holed base plate.
 
 `exports.build_supports(atom_objects, collection, ...)` is the underlying builder (defaults differ slightly: `support_layer=0.8`); pass `bond_objects=` the bond meshes so it can avoid them.
 
